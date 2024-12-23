@@ -1,5 +1,3 @@
-# @version ^0.3.7
-
 # Constants
 SIZE: constant(uint256) = 52
 MAX_SECURITY: constant(uint256) = 63

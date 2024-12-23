@@ -1,6 +1,3 @@
-# @version ^0.3.7
-# no-limit hold'em sit-n-go single-table tournaments
-
 MAX_PLAYERS: constant(uint256) = 127 # to distinguish from MAX_SIZE when inlining
 
 struct Proof:

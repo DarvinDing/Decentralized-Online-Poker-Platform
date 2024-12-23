@@ -1,0 +1,365 @@
+# @version ^0.3.7
+
+# Constants
+SIZE: constant(uint256) = 52
+MAX_SECURITY: constant(uint256) = 63
+
+# Proof structure for cryptographic operations
+struct Proof:
+    gs: uint256[2]  # g ** s
+    hs: uint256[2]  # h ** s
+    scx: uint256    # s + cx (mod q), where c = hash(g, h, gx, hx, gs, hs)
+
+struct CP:
+    g: uint256[2]   # Random point g
+    h: uint256[2]   # Random point h
+    gx: uint256[2]  # g ** x
+    hx: uint256[2]  # h ** x
+    p: Proof
+
+import Deck as DeckManager
+
+D: immutable(DeckManager)
+
+# Game configuration constants
+MAX_SEATS: constant(uint256) = 9  # Maximum seats per table
+MAX_LEVELS: constant(uint256) = 100 # Maximum number of levels in tournament structure
+
+Req_DECK: constant(uint256) = 0  # Must be hidden by all
+Req_HAND: constant(uint256) = 1  # Must be hidden by owner and shown by others
+Req_SHOW: constant(uint256) = 2  # Must be shown by all
+
+# Game phases
+Phase_JOIN: constant(uint256) = 1  # Before the game starts, players take seats
+Phase_PREP: constant(uint256) = 2  # All players seated, preparing the deck
+Phase_SHUF: constant(uint256) = 3  # Submitting shuffles and verifications
+Phase_DEAL: constant(uint256) = 4  # Drawing and possibly opening cards
+Phase_PLAY: constant(uint256) = 5  # Betting phase
+Phase_SHOW: constant(uint256) = 6  # Showdown phase
+
+# Game configuration structure
+struct Config:
+    buyIn: uint256               # Entry ticket price per player
+    bond: uint256                # Liveness bond for each player
+    startsWith: uint256          # Game starts when this many players are seated
+    untilLeft: uint256           # Game ends when this many players are left
+    structure: DynArray[uint256, 100] # Small blind levels
+    levelBlocks: uint256         # Blocks between levels
+    verifRounds: uint256         # Number of shuffle verifications required
+    prepBlocks: uint256          # Blocks to submit deck preparation
+    shuffBlocks: uint256         # Blocks to submit shuffle
+    verifBlocks: uint256         # Blocks to submit shuffle verification
+    dealBlocks: uint256          # Blocks to submit card decryptions
+    actBlocks: uint256           # Blocks to act before folding can be triggered
+
+interface GameManager:
+    def checkConfig(_config: Config, _seatIndex: uint256): view
+    def afterShuffle(_tableId: uint256): nonpayable
+    def afterDeal(_tableId: uint256, _phase: uint256): nonpayable
+
+gameAddress: address
+
+# Table structure to manage game state
+struct Table:
+    config: Config
+    seats: address[9]           # Player addresses in seats at the start of the game
+    game: GameManager           # Game contract reference
+    deckId: uint256             # ID of deck in deck contract
+    phase: uint256              # Current phase of the game
+    nextPhase: uint256          # Phase to enter after dealing
+    present: uint256            # Player contribution to the current shuffle
+    shuffled: uint256           # Player verification of current shuffle
+    commitBlock: uint256        # Block from which new commitments are required
+    deckIndex: uint256          # Index of next card in deck
+    drawIndex: uint256[26]      # Player the card is drawn to
+    requirement: uint256[26]    # Revelation requirement level
+
+tables: HashMap[uint256, Table]
+nextTableId: uint256
+
+nextWaitingTable: public(HashMap[uint256, uint256])
+prevWaitingTable: public(HashMap[uint256, uint256])
+numWaiting: HashMap[uint256, uint256]
+nextLiveTable: public(HashMap[address, HashMap[uint256, uint256]])
+prevLiveTable: public(HashMap[address, HashMap[uint256, uint256]])
+
+@external
+def __init__(_deckAddr: address):
+    D = DeckManager(_deckAddr)
+    self.nextTableId = 1
+    self.gameAddress = msg.sender
+
+@external
+def setGameAddress(_gameAddr: address):
+    self.gameAuth()
+    self.gameAddress = _gameAddr
+
+@external
+@view
+def deckAddress() -> address:
+    return D.address
+
+@internal
+def forceSend(_to: address, _amount: uint256) -> bool:
+    return raw_call(_to, b"", value=_amount, gas=0, revert_on_failure=False)
+
+# Lobby events
+event JoinTable:
+    table: indexed(uint256)
+    player: indexed(address)
+    seat: indexed(uint256)
+
+event LeaveTable:
+    table: indexed(uint256)
+    player: indexed(address)
+
+event StartGame:
+    table: indexed(uint256)
+
+event EndGame:
+    table: indexed(uint256)
+
+@internal
+def playerJoinWaiting(_tableId: uint256, _seatIndex: uint256):
+    if self.numWaiting[_tableId] == empty(uint256):
+        self.nextWaitingTable[_tableId] = self.nextWaitingTable[0]
+        self.nextWaitingTable[0] = _tableId
+        self.prevWaitingTable[_tableId] = 0
+        self.prevWaitingTable[self.nextWaitingTable[_tableId]] = _tableId
+    self.numWaiting[_tableId] = unsafe_add(self.numWaiting[_tableId], 1)
+    log JoinTable(_tableId, msg.sender, _seatIndex)
+
+@internal
+def playerLeaveWaiting(_tableId: uint256, _num: uint256):
+    self.numWaiting[_tableId] = unsafe_sub(self.numWaiting[_tableId], _num)
+    if self.numWaiting[_tableId] == empty(uint256):
+        self.nextWaitingTable[self.prevWaitingTable[_tableId]] = self.nextWaitingTable[_tableId]
+        self.prevWaitingTable[self.nextWaitingTable[_tableId]] = self.prevWaitingTable[_tableId]
+
+@internal
+def playerLeaveLive(_tableId: uint256, _player: address):
+    self.nextLiveTable[_player][self.prevLiveTable[_player][_tableId]] = self.nextLiveTable[_player][_tableId]
+    self.prevLiveTable[_player][self.nextLiveTable[_player][_tableId]] = self.prevLiveTable[_player][_tableId]
+    log LeaveTable(_tableId, _player)
+
+@internal
+@view
+def validatePhase(_tableId: uint256, _phase: uint256):
+    assert self.tables[_tableId].phase == _phase, "Wrong phase"
+
+@internal
+@view
+def gameAuth():
+    assert self.gameAddress == msg.sender, "Unauthorized"
+
+@internal
+@view
+def checkAuth(_tableId: uint256, _seatIndex: uint256):
+    assert self.tables[_tableId].seats[_seatIndex] == msg.sender, "Unauthorized"
+
+@external
+@payable
+def createTable(_seatIndex: uint256, _config: Config) -> uint256:
+    GameManager(self.gameAddress).checkConfig(_config, _seatIndex)
+    assert msg.value == unsafe_add(_config.bond, _config.buyIn), "Incorrect bond + buyIn"
+    tableId: uint256 = self.nextTableId
+    self.tables[tableId].game = GameManager(self.gameAddress)
+    self.tables[tableId].deckId = D.newDeck(_config.startsWith)
+    self.tables[tableId].phase = Phase_JOIN
+    self.tables[tableId].config = _config
+    self.tables[tableId].seats[_seatIndex] = msg.sender
+    self.nextTableId = unsafe_add(tableId, 1)
+    self.playerJoinWaiting(tableId, _seatIndex)
+    self.tables[tableId].present = 1
+    return tableId
+
+@external
+@payable
+def joinTable(_tableId: uint256, _seatIndex: uint256):
+    self.validatePhase(_tableId, Phase_JOIN)
+    numPlayers: uint256 = self.tables[_tableId].config.startsWith
+    assert _seatIndex < numPlayers, "Invalid seatIndex"
+    assert self.tables[_tableId].seats[_seatIndex] == empty(address), "SeatIndex unavailable"
+    for seatIndex in range(MAX_SEATS):
+        if seatIndex == numPlayers: break
+        assert self.tables[_tableId].seats[seatIndex] != msg.sender, "Already joined"
+    assert msg.value == unsafe_add(
+        self.tables[_tableId].config.bond, self.tables[_tableId].config.buyIn), "Incorrect bond + buyIn"
+    self.tables[_tableId].seats[_seatIndex] = msg.sender
+    self.playerJoinWaiting(_tableId, _seatIndex)
+    numJoined: uint256 = unsafe_add(self.tables[_tableId].present, 1)
+    self.tables[_tableId].present = numJoined
+    if numJoined == numPlayers:
+        self.tables[_tableId].present = 0
+        for seatIndex in range(MAX_SEATS):
+            if seatIndex == numPlayers: break
+            player: address = self.tables[_tableId].seats[seatIndex]
+            self.tables[_tableId].present |= shift(1, convert(seatIndex, int128))
+            self.nextLiveTable[player][_tableId] = self.nextLiveTable[player][0]
+            self.nextLiveTable[player][0] = _tableId
+            self.prevLiveTable[player][_tableId] = 0
+            self.prevLiveTable[player][self.nextLiveTable[player][_tableId]] = _tableId
+        self.playerLeaveWaiting(_tableId, numPlayers)
+        self.tables[_tableId].phase = Phase_PREP
+        self.tables[_tableId].commitBlock = block.number
+        log StartGame(_tableId)
+
+@external
+def leaveTable(_tableId: uint256, _seatIndex: uint256):
+    self.validatePhase(_tableId, Phase_JOIN)
+    self.checkAuth(_tableId, _seatIndex)
+    self.tables[_tableId].seats[_seatIndex] = empty(address)
+    self.forceSend(msg.sender, unsafe_add(self.tables[_tableId].config.bond, self.tables[_tableId].config.buyIn))
+    self.playerLeaveWaiting(_tableId, 1)
+    self.tables[_tableId].present = unsafe_sub(self.tables[_tableId].present, 1)
+    log LeaveTable(_tableId, msg.sender)
+
+@external
+def refundPlayer(_tableId: uint256, _seatIndex: uint256, _stack: uint256):
+    self.gameAuth()
+    player: address = self.tables[_tableId].seats[_seatIndex]
+    self.forceSend(player, unsafe_add(self.tables[_tableId].config.bond, _stack))
+    self.playerLeaveLive(_tableId, player)
+
+@external
+def deleteTable(_tableId: uint256):
+    self.gameAuth()
+    self.tables[_tableId] = empty(Table)
+    log EndGame(_tableId)
+
+# Timeouts and challenge events
+event Challenge:
+    table: indexed(uint256)
+    player: indexed(address)
+    sender: indexed(address)
+    type: uint256
+
+@internal
+@view
+def checkDeadline(_tableId: uint256, _blocks: uint256):
+    assert block.number > (self.tables[_tableId].commitBlock + _blocks), "Deadline not passed"
+
+@external
+def submitPrepTimeout(_tableId: uint256, _seatIndex: uint256):
+    self.validatePhase(_tableId, Phase_PREP)
+    self.checkDeadline(_tableId, self.tables[_tableId].config.prepBlocks)
+    assert not D.hasSubmittedPrep(self.tables[_tableId].deckId, _seatIndex), "Already submitted"
+    self.failChallenge(_tableId, _seatIndex, 0)
+
+@external
+def verifyPrepTimeout(_tableId: uint256, _seatIndex: uint256):
+    self.validatePhase(_tableId, Phase_PREP)
+    self.checkDeadline(_tableId, self.tables[_tableId].config.prepBlocks)
+    deckId: uint256 = self.tables[_tableId].deckId
+    assert D.allSubmittedPrep(deckId), "Not submitted"
+    assert not D.hasVerifiedPrep(deckId, _seatIndex), "Already verified"
+    self.failChallenge(_tableId, _seatIndex, 1)
+
+@external
+def submitShuffleTimeout(_tableId: uint256, _seatIndex: uint256):
+    self.validatePhase(_tableId, Phase_SHUF)
+    self.checkDeadline(_tableId, self.tables[_tableId].config.shuffBlocks)
+    assert self.shuffleCount(_tableId) == _seatIndex, "Wrong player"
+    self.failChallenge(_tableId, _seatIndex, 2)
+
+@external
+def verifyShuffleTimeout(_tableId: uint256, _seatIndex: uint256):
+    self.validatePhase(_tableId, Phase_SHUF)
+    self.checkDeadline(_tableId, self.tables[_tableId].config.verifBlocks)
+    assert self.shuffleCount(_tableId) == _seatIndex, "Wrong player"
+    assert not D.challengeActive(self.tables[_tableId].deckId, _seatIndex), "Already verified"
+    self.failChallenge(_tableId, _seatIndex, 3)
+
+@external
+def decryptTimeout(_tableId: uint256, _seatIndex: uint256, _cardIndex: uint256):
+    self.validatePhase(_tableId, Phase_DEAL)
+    self.checkDeadline(_tableId, self.tables[_tableId].config.dealBlocks)
+    assert self.tables[_tableId].requirement[_cardIndex] != Req_DECK, "Not required"
+    assert self.decryptCount(_tableId, _cardIndex) == _seatIndex, "Already decrypted"
+    self.failChallenge(_tableId, _seatIndex, 4)
+
+@external
+def revealTimeout(_tableId: uint256, _seatIndex: uint256, _cardIndex: uint256):
+    self.validatePhase(_tableId, Phase_DEAL)
+    self.checkDeadline(_tableId, self.tables[_tableId].config.dealBlocks)
+    assert self.tables[_tableId].drawIndex[_cardIndex] == _seatIndex, "Wrong player"
+    assert self.tables[_tableId].requirement[_cardIndex] == Req_SHOW, "Not required"
+    assert D.openedCard(self.tables[_tableId].deckId, _cardIndex) == 0, "Already opened"
+    self.failChallenge(_tableId, _seatIndex, 5)
+
+@internal
+def failChallenge(_tableId: uint256, _challIndex: uint256, _type: uint256):
+    numPlayers: uint256 = self.tables[_tableId].config.startsWith
+    perPlayer: uint256 = unsafe_add(self.tables[_tableId].config.bond, self.tables[_tableId].config.buyIn)
+    for seatIndex in range(MAX_SEATS):
+        if seatIndex == numPlayers:
+            break
+        player: address = self.tables[_tableId].seats[seatIndex]
+        if seatIndex == _challIndex:
+            self.forceSend(empty(address), perPlayer)
+            log Challenge(_tableId, player, msg.sender, _type)
+        else:
+            self.forceSend(player, perPlayer)
+        self.playerLeaveLive(_tableId, player)
+    self.tables[_tableId] = empty(Table)
+    log EndGame(_tableId)
+
+# Deck setup events
+event DeckPrep:
+    table: indexed(uint256)
+    player: indexed(address)
+    step: indexed(uint256)
+
+@external
+def submitPrep(_tableId: uint256, _seatIndex: uint256, _hash: bytes32):
+    self.validatePhase(_tableId, Phase_PREP)
+    self.checkAuth(_tableId, _seatIndex)
+    deckId: uint256 = self.tables[_tableId].deckId
+    D.submitPrep(deckId, _seatIndex, _hash)
+    log DeckPrep(_tableId, msg.sender, 0)
+    numSubmitted: uint256 = unsafe_add(self.tables[_tableId].deckIndex, 1)
+    self.tables[_tableId].deckIndex = numSubmitted
+    if numSubmitted == self.tables[_tableId].config.startsWith:
+        D.finishSubmit(deckId)
+        self.tables[_tableId].deckIndex = 0
+    self.tables[_tableId].commitBlock = block.number
+
+@external
+def verifyPrep(_tableId: uint256, _seatIndex: uint256, _prep: CP[53]):
+    self.validatePhase(_tableId, Phase_PREP)
+    self.checkAuth(_tableId, _seatIndex)
+    deckId: uint256 = self.tables[_tableId].deckId
+    D.verifyPrep(deckId, _seatIndex, _prep)
+    log DeckPrep(_tableId, msg.sender, 1)
+    numVerified: uint256 = unsafe_add(self.tables[_tableId].deckIndex, 1)
+    self.tables[_tableId].deckIndex = numVerified
+    if numVerified == self.tables[_tableId].config.startsWith:
+        D.finishPrep(deckId)
+        for seatIndex in range(MAX_SEATS):
+            if seatIndex == numVerified: break
+            self.tables[_tableId].drawIndex[seatIndex] = seatIndex
+            self.tables[_tableId].requirement[seatIndex] = Req_SHOW
+        self.tables[_tableId].deckIndex = 0
+        self.tables[_tableId].phase = Phase_SHUF
+        self.tables[_tableId].nextPhase = Phase_PLAY
+    self.tables[_tableId].commitBlock = block.number
+
+# Shuffle events
+event Shuffle:
+    table: indexed(uint256)
+    player: indexed(address)
+    step: indexed(uint256)
+
+@internal
+@view
+def shuffleCount(_tableId: uint256) -> uint256:
+    return D.shuffleCount(self.tables[_tableId].deckId)
+
+@external
+def submitShuffle(_tableId: uint256, _seatIndex: uint256,
+                  _shuffle: uint256[2][53], _hash: bytes32) -> uint256:
+    self.validatePhase(_tableId, Phase_SHUF)
+    self.checkAuth(_tableId, _seatIndex)
+    deckId: uint256 = self.tables[_tableId].deckId
+    self.tables[_tableId].commitBlock = block.number
+    D.submitShuffle(deckId
